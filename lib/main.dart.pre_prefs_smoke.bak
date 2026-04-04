@@ -1,0 +1,381 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math';
+
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+
+void main() {
+  runApp(const PipeLayoutApp());
+}
+
+class PipeLayoutApp extends StatelessWidget {
+  const PipeLayoutApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Pipe Layout Scanner',
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
+        useMaterial3: true,
+      ),
+      home: const PipeLayoutHomePage(),
+    );
+  }
+}
+
+class PipeLayoutHomePage extends StatefulWidget {
+  const PipeLayoutHomePage({super.key});
+
+  @override
+  State<PipeLayoutHomePage> createState() => _PipeLayoutHomePageState();
+}
+
+class _PipeLayoutHomePageState extends State<PipeLayoutHomePage> {
+  final TextEditingController _urlController =
+      TextEditingController(text: 'http://192.168.4.70:8000');
+  final ScrollController _scrollController = ScrollController();
+
+  bool _busy = false;
+  String _status = 'Ready';
+  String _output = '';
+
+  List<List<double>>? _loadedPoints;
+  String? _loadedFileName;
+
+  static const Duration shortTimeout = Duration(seconds: 15);
+  static const Duration longTimeout = Duration(seconds: 60);
+
+  Uri _uri(String path) {
+    final base = _urlController.text.trim().replaceAll(RegExp(r'/$'), '');
+    return Uri.parse('$base$path');
+  }
+
+  Future<void> _setStatus(String text) async {
+    if (!mounted) return;
+    setState(() => _status = text);
+  }
+
+  Future<void> _setOutput(dynamic obj) async {
+    if (!mounted) return;
+    setState(() => _output = const JsonEncoder.withIndent('  ').convert(obj));
+    await Future.delayed(const Duration(milliseconds: 10));
+    if (_scrollController.hasClients) {
+      _scrollController.animateTo(
+        _scrollController.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 200),
+        curve: Curves.easeOut,
+      );
+    }
+  }
+
+  Future<Map<String, dynamic>> _request(Future<http.Response> req, Duration timeout) async {
+    final resp = await req.timeout(timeout);
+    final body = resp.body.isEmpty ? '{}' : resp.body;
+
+    if (resp.statusCode < 200 || resp.statusCode >= 300) {
+      throw Exception('HTTP ${resp.statusCode}: $body');
+    }
+
+    final decoded = json.decode(body);
+    if (decoded is Map<String, dynamic>) return decoded;
+    return {'data': decoded};
+  }
+
+  Future<void> _run(String label, Future<void> Function() fn) async {
+    if (_busy) return;
+    setState(() {
+      _busy = true;
+      _status = '$label...';
+    });
+
+    try {
+      await fn();
+      await _setStatus('$label OK');
+    } on TimeoutException {
+      await _setStatus('$label timeout');
+      await _setOutput({'error': 'Request timeout'});
+    } catch (e) {
+      await _setStatus('$label failed');
+      await _setOutput({'error': e.toString()});
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  List<List<double>> _syntheticPoints({int pipePoints = 8000, int noisePoints = 500}) {
+    final rnd = Random();
+    final points = <List<double>>[];
+
+    for (int i = 0; i < pipePoints; i++) {
+      final x = -2.0 + rnd.nextDouble() * 4.0;
+      final t = rnd.nextDouble() * 2 * pi;
+      final r = 0.02 + (rnd.nextDouble() * 0.004 - 0.002);
+      final y = r * cos(t) + (rnd.nextDouble() * 0.004 - 0.002);
+      final z = r * sin(t) + (rnd.nextDouble() * 0.004 - 0.002);
+      points.add([x, y, z]);
+    }
+
+    for (int i = 0; i < noisePoints; i++) {
+      points.add([
+        -3 + rnd.nextDouble() * 6,
+        -3 + rnd.nextDouble() * 6,
+        -3 + rnd.nextDouble() * 6,
+      ]);
+    }
+
+    return points;
+  }
+
+  List<List<double>> _extractPoints(dynamic data) {
+    final dynamic raw = (data is Map<String, dynamic>) ? data['points'] : data;
+    if (raw is! List) {
+      throw Exception('JSON must be a list or {"points":[...]}');
+    }
+
+    final out = <List<double>>[];
+    for (final p in raw) {
+      if (p is List && p.length == 3) {
+        final x = (p[0] as num?)?.toDouble();
+        final y = (p[1] as num?)?.toDouble();
+        final z = (p[2] as num?)?.toDouble();
+        if (x != null && y != null && z != null) {
+          out.add([x, y, z]);
+        }
+      }
+    }
+
+    if (out.length < 200) {
+      throw Exception('Need at least 200 valid points, found ${out.length}');
+    }
+
+    return out;
+  }
+
+  Future<void> _health() async {
+    await _run('Health', () async {
+      final result = await _request(http.get(_uri('/health')), shortTimeout);
+      await _setOutput({'endpoint': '/health', 'response': result});
+    });
+  }
+
+  Future<void> _sendSynthetic() async {
+    await _run('Synthetic scan', () async {
+      final points = _syntheticPoints();
+      final result = await _request(
+        http.post(
+          _uri('/process_scan'),
+          headers: {'Content-Type': 'application/json'},
+          body: json.encode({'points': points}),
+        ),
+        longTimeout,
+      );
+      await _setOutput({
+        'endpoint': '/process_scan',
+        'points_sent': points.length,
+        'response': result,
+      });
+    });
+  }
+
+  Future<void> _saveSynthetic() async {
+    await _run('Save synthetic', () async {
+      final points = _syntheticPoints();
+      final result = await _request(
+        http.post(
+          _uri('/save_scan'),
+          headers: {'Content-Type': 'application/json'},
+          body: json.encode({'points': points, 'tag': 'flutter'}),
+        ),
+        longTimeout,
+      );
+      await _setOutput({'endpoint': '/save_scan', 'response': result});
+    });
+  }
+
+  Future<void> _replayLatest() async {
+    await _run('Replay latest', () async {
+      final list = await _request(http.get(_uri('/list_scans')), shortTimeout);
+      final scans = list['scans'];
+      if (scans is! List || scans.isEmpty) {
+        throw Exception('No scans from /list_scans');
+      }
+
+      final latest = scans.first;
+      final filePath = (latest is Map<String, dynamic>) ? latest['file_path'] : null;
+      if (filePath == null) throw Exception('Latest scan missing file_path');
+
+      final result = await _request(
+        http.post(
+          _uri('/process_scan_file'),
+          headers: {'Content-Type': 'application/json'},
+          body: json.encode({'file_path': filePath}),
+        ),
+        longTimeout,
+      );
+
+      await _setOutput({
+        'endpoint': '/process_scan_file',
+        'file_path': filePath,
+        'response': result,
+      });
+    });
+  }
+
+  Future<void> _loadScanJson() async {
+    await _run('Load JSON file', () async {
+      final picked = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: ['json'],
+        withData: true,
+      );
+
+      if (picked == null || picked.files.isEmpty) {
+        throw Exception('File selection cancelled');
+      }
+
+      final file = picked.files.first;
+      final name = file.name;
+      String content;
+
+      if (file.bytes != null) {
+        content = utf8.decode(file.bytes!);
+      } else if (file.path != null) {
+        content = await File(file.path!).readAsString();
+      } else {
+        throw Exception('Cannot read selected file');
+      }
+
+      final decoded = json.decode(content);
+      final pts = _extractPoints(decoded);
+
+      if (!mounted) return;
+      setState(() {
+        _loadedPoints = pts;
+        _loadedFileName = name;
+      });
+
+      await _setOutput({
+        'action': 'load_scan_json',
+        'file': name,
+        'valid_points': pts.length,
+      });
+    });
+  }
+
+  Future<void> _processLoadedScan() async {
+    await _run('Process loaded scan', () async {
+      final pts = _loadedPoints;
+      if (pts == null || pts.isEmpty) {
+        throw Exception('No loaded scan. Tap "Load Scan JSON" first.');
+      }
+
+      final result = await _request(
+        http.post(
+          _uri('/process_scan'),
+          headers: {'Content-Type': 'application/json'},
+          body: json.encode({'points': pts}),
+        ),
+        longTimeout,
+      );
+
+      await _setOutput({
+        'endpoint': '/process_scan',
+        'source': _loadedFileName ?? 'loaded_json',
+        'points_sent': pts.length,
+        'response': result,
+      });
+    });
+  }
+
+  Widget _button(String title, VoidCallback onPressed, {Color? color}) {
+    return SizedBox(
+      width: double.infinity,
+      height: 56,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: ElevatedButton(
+          onPressed: _busy ? null : onPressed,
+          style: ElevatedButton.styleFrom(
+            backgroundColor: color,
+            textStyle: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+          ),
+          child: Text(title),
+        ),
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _urlController.dispose();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Pipe Layout Scanner')),
+      body: SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('Backend URL', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 6),
+              TextField(
+                controller: _urlController,
+                decoration: const InputDecoration(
+                  border: OutlineInputBorder(),
+                  hintText: 'http://192.168.4.70:8000',
+                ),
+              ),
+              const SizedBox(height: 10),
+              _button('Health Check', _health, color: Colors.blue),
+              _button('Send Synthetic Scan', _sendSynthetic, color: Colors.green),
+              _button('Save Synthetic Scan', _saveSynthetic, color: Colors.orange),
+              _button('Replay Latest Scan', _replayLatest, color: Colors.purple),
+              _button('Load Scan JSON', _loadScanJson, color: Colors.teal),
+              _button('Process Loaded Scan', _processLoadedScan, color: Colors.indigo),
+              const SizedBox(height: 8),
+              Text(
+                'Status: $_status',
+                style: const TextStyle(fontWeight: FontWeight.w600),
+              ),
+              if (_loadedPoints != null) ...[
+                const SizedBox(height: 4),
+                Text('Loaded file: ${_loadedFileName ?? '-'} | points: ${_loadedPoints!.length}'),
+              ],
+              const SizedBox(height: 8),
+              const Divider(height: 1),
+              const SizedBox(height: 8),
+              Expanded(
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Colors.grey.shade400),
+                    borderRadius: BorderRadius.circular(8),
+                    color: Colors.grey.shade50,
+                  ),
+                  child: SingleChildScrollView(
+                    controller: _scrollController,
+                    child: Text(
+                      _output.isEmpty ? 'No output yet.' : _output,
+                      style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}

@@ -1,0 +1,475 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:math';
+
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+
+void main() {
+  runApp(const PipeLayoutApp());
+}
+
+class PipeLayoutApp extends StatelessWidget {
+  const PipeLayoutApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Pipe Layout Control',
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
+        useMaterial3: true,
+      ),
+      home: const PipeLayoutHomePage(),
+    );
+  }
+}
+
+class PipeLayoutHomePage extends StatefulWidget {
+  const PipeLayoutHomePage({super.key});
+
+  @override
+  State<PipeLayoutHomePage> createState() => _PipeLayoutHomePageState();
+}
+
+class _PipeLayoutHomePageState extends State<PipeLayoutHomePage> {
+  final TextEditingController _urlController =
+      TextEditingController(text: 'http://192.168.4.70:8000');
+  final ScrollController _scrollController = ScrollController();
+
+  String _statusText = 'Ready';
+  String _outputJson = '';
+  bool _busy = false;
+
+  List<Map<String, dynamic>> _scans = [];
+  Map<String, dynamic>? _lastProcessResult;
+  String? _lastProcessingInfo;
+
+  static const Duration requestTimeout = Duration(seconds: 10);
+
+  Uri _buildUri(String path) {
+    final base = _urlController.text.trim();
+    final normalized = base.endsWith('/') ? base.substring(0, base.length - 1) : base;
+    return Uri.parse('$normalized$path');
+  }
+
+  Future<void> _setStatus(String status) async {
+    if (!mounted) return;
+    setState(() => _statusText = status);
+  }
+
+  Future<void> _writeOutput(dynamic obj) async {
+    if (!mounted) return;
+
+    setState(() {
+      _outputJson = const JsonEncoder.withIndent('  ').convert(obj);
+    });
+
+    await Future.delayed(const Duration(milliseconds: 10));
+    if (_scrollController.hasClients) {
+      _scrollController.animateTo(
+        _scrollController.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 250),
+        curve: Curves.easeOut,
+      );
+    }
+  }
+
+  Future<Map<String, dynamic>> _requestJson(Future<http.Response> futureReq) async {
+    final response = await futureReq.timeout(requestTimeout);
+    final body = response.body.isEmpty ? '{}' : response.body;
+
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      // Include full body for easier debugging (especially 422)
+      throw Exception('HTTP ${response.statusCode}: $body');
+    }
+
+    final decoded = json.decode(body);
+    if (decoded is Map<String, dynamic>) return decoded;
+    return {'data': decoded};
+  }
+
+  Future<void> _doWithBusy(Future<void> Function() action) async {
+    if (_busy) return;
+
+    setState(() {
+      _busy = true;
+      _statusText = 'Processing...';
+    });
+
+    try {
+      await action();
+      await _setStatus('Success');
+    } on TimeoutException {
+      await _setStatus('Error: Request timeout');
+      await _writeOutput({'error': 'Request timed out after ${requestTimeout.inSeconds}s'});
+    } catch (e) {
+      await _setStatus('Error');
+      await _writeOutput({'error': e.toString()});
+    } finally {
+      if (mounted) {
+        setState(() => _busy = false);
+      }
+    }
+  }
+
+  Future<void> _healthCheck() async {
+    await _doWithBusy(() async {
+      final result = await _requestJson(http.get(_buildUri('/health')));
+      await _writeOutput({'endpoint': '/health', 'response': result});
+    });
+  }
+
+  Future<void> _listScans() async {
+    await _doWithBusy(() async {
+      final data = await _requestJson(http.get(_buildUri('/list_scans')));
+      final rawScans = data['scans'];
+
+      final scans = <Map<String, dynamic>>[];
+      if (rawScans is List) {
+        for (final item in rawScans) {
+          if (item is Map<String, dynamic>) scans.add(item);
+        }
+      }
+
+      setState(() => _scans = scans);
+      await _writeOutput({'endpoint': '/list_scans', 'response': data});
+    });
+  }
+
+  Future<void> _processScanFile(String filePath) async {
+    await _doWithBusy(() async {
+      final response = await http
+          .post(
+            _buildUri('/process_scan_file'),
+            headers: {'Content-Type': 'application/json'},
+            body: json.encode({'file_path': filePath}),
+          )
+          .timeout(const Duration(seconds: 60));
+
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw Exception('HTTP ${response.statusCode}: ${response.body}');
+      }
+
+      final data = json.decode(response.body);
+      final map = data is Map<String, dynamic> ? data : <String, dynamic>{'data': data};
+
+      final processingMs = map['processing_ms'];
+      final device = map['device'] ?? '';
+      setState(() {
+        _lastProcessResult = map;
+        _lastProcessingInfo = 'Processed ${processingMs ?? '?'} ms on $device';
+      });
+
+      await _writeOutput({
+        'endpoint': '/process_scan_file',
+        'file_path': filePath,
+        'response': map,
+      });
+    });
+  }
+
+  List<List<double>> syntheticPoints({int pipePoints = 8000, int noisePoints = 500}) {
+    final rnd = Random();
+    final points = <List<double>>[];
+
+    for (int i = 0; i < pipePoints; i++) {
+      final x = -2.0 + rnd.nextDouble() * 4.0;
+      final theta = rnd.nextDouble() * 2 * pi;
+      final r = 0.02 + (rnd.nextDouble() * 0.004 - 0.002);
+      final y = r * cos(theta) + (rnd.nextDouble() * 0.004 - 0.002);
+      final z = r * sin(theta) + (rnd.nextDouble() * 0.004 - 0.002);
+      points.add([x, y, z]);
+    }
+
+    for (int i = 0; i < noisePoints; i++) {
+      points.add([
+        -3 + rnd.nextDouble() * 6,
+        -3 + rnd.nextDouble() * 6,
+        -3 + rnd.nextDouble() * 6,
+      ]);
+    }
+
+    return points;
+  }
+
+  Future<void> _sendSyntheticScan() async {
+    await _doWithBusy(() async {
+      final points = syntheticPoints();
+
+      if (points.length < 200 || points.first.length != 3) {
+        throw Exception('Bad points shape. Need [[x,y,z], ...] and >=200 points.');
+      }
+
+      final payload = {
+        'points': points.map((p) => [p[0], p[1], p[2]]).toList(),
+      };
+
+      final response = await http
+          .post(
+            _buildUri('/process_scan'),
+            headers: {'Content-Type': 'application/json'},
+            body: json.encode(payload),
+          )
+          .timeout(const Duration(seconds: 60));
+
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw Exception('HTTP ${response.statusCode}: ${response.body}');
+      }
+
+      final data = json.decode(response.body);
+      await _writeOutput({'endpoint': '/process_scan', 'points': points.length, 'response': data});
+    });
+  }
+
+  Future<void> _saveSyntheticScan() async {
+    await _doWithBusy(() async {
+      final points = syntheticPoints();
+
+      if (points.length < 200 || points.first.length != 3) {
+        throw Exception('Bad points shape. Need [[x,y,z], ...] and >=200 points.');
+      }
+
+      final result = await _requestJson(
+        http.post(
+          _buildUri('/save_scan'),
+          headers: {'Content-Type': 'application/json'},
+          body: json.encode({'points': points, 'tag': 'flutter'}),
+        ),
+      );
+
+      await _writeOutput({'endpoint': '/save_scan', 'points': points.length, 'response': result});
+    });
+  }
+
+  Future<void> _replayLatestScan() async {
+    await _doWithBusy(() async {
+      final listResponse = await _requestJson(http.get(_buildUri('/list_scans')));
+      final scans = listResponse['scans'];
+
+      if (scans is! List || scans.isEmpty) {
+        throw Exception('No scans available from /list_scans');
+      }
+
+      // Backend returns newest first
+      final latest = scans.first;
+      final filePath = latest is Map<String, dynamic> ? latest['file_path'] : null;
+
+      if (filePath == null || filePath.toString().isEmpty) {
+        throw Exception('Latest scan does not contain file_path');
+      }
+
+      final result = await _requestJson(
+        http.post(
+          _buildUri('/process_scan_file'),
+          headers: {'Content-Type': 'application/json'},
+          body: json.encode({'file_path': filePath}),
+        ),
+      );
+
+      await _writeOutput({
+        'endpoint': '/process_scan_file',
+        'file_path': filePath,
+        'scan_list_count': scans.length,
+        'response': result,
+      });
+    });
+  }
+
+  num? _asNum(dynamic v) {
+    if (v is num) return v;
+    if (v is String) return num.tryParse(v);
+    return null;
+  }
+
+  @override
+  void dispose() {
+    _urlController.dispose();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  Widget _actionButton(String label, VoidCallback callback) {
+    return SizedBox(
+      width: double.infinity,
+      height: 60,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 6),
+        child: ElevatedButton(
+          onPressed: _busy ? null : callback,
+          style: ElevatedButton.styleFrom(
+            textStyle: const TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+          ),
+          child: Text(label),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Pipe Layout Scanner')),
+      body: SafeArea(
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final available = constraints.maxHeight;
+
+            return SingleChildScrollView(
+              child: ConstrainedBox(
+                constraints: BoxConstraints(minHeight: available),
+                child: Padding(
+                  padding: const EdgeInsets.all(12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Backend URL',
+                        style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                      ),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: _urlController,
+                        keyboardType: TextInputType.url,
+                        decoration: const InputDecoration(
+                          border: OutlineInputBorder(),
+                          hintText: 'http://192.168.4.70:8000',
+                        ),
+                        style: const TextStyle(fontSize: 16),
+                      ),
+                      const SizedBox(height: 14),
+                      _actionButton('Health Check → GET /health', _healthCheck),
+                      _actionButton('Send Synthetic Scan → POST /process_scan', _sendSyntheticScan),
+                      _actionButton('Save Synthetic Scan → POST /save_scan', _saveSyntheticScan),
+                      _actionButton('List Scans → GET /list_scans', _listScans),
+                      _actionButton('Replay Latest Scan → GET /list_scans + POST /process_scan_file', _replayLatestScan),
+                      const SizedBox(height: 12),
+
+                      if (_scans.isNotEmpty) ...[
+                        const Text(
+                          'Available scans',
+                          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                        ),
+                        const SizedBox(height: 8),
+                        Container(
+                          height: 180,
+                          decoration: BoxDecoration(
+                            border: Border.all(color: Colors.grey.shade300),
+                            borderRadius: BorderRadius.circular(8),
+                            color: Colors.white,
+                          ),
+                          child: ListView.builder(
+                            itemCount: _scans.length,
+                            itemBuilder: (context, i) {
+                              final scan = _scans[i];
+                              final filePath = (scan['file_path'] ?? '').toString();
+
+                              return ListTile(
+                                title: Text(filePath, style: const TextStyle(fontSize: 14)),
+                                trailing: ElevatedButton(
+                                  onPressed: _busy || filePath.isEmpty
+                                      ? null
+                                      : () => _processScanFile(filePath),
+                                  child: const Text('Process'),
+                                ),
+                              );
+                            },
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                      ],
+
+                      if (_lastProcessResult != null) ...[
+                        Text(
+                          _lastProcessingInfo ?? '',
+                          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                        ),
+                        const SizedBox(height: 8),
+                        SizedBox(
+                          height: min(230, available * 0.35),
+                          child: ListView.builder(
+                            itemCount: (_lastProcessResult!['pipes'] is List)
+                                ? (_lastProcessResult!['pipes'] as List).length
+                                : 0,
+                            itemBuilder: (context, i) {
+                              final pipes = _lastProcessResult!['pipes'] as List<dynamic>;
+                              final p = pipes[i] is Map<String, dynamic>
+                                  ? pipes[i] as Map<String, dynamic>
+                                  : <String, dynamic>{};
+
+                              final lengthMeters = _asNum(
+                                p['length_meters'] ?? p['length_m'] ?? p['length'],
+                              );
+                              final diameterMeters = _asNum(
+                                p['diameter_meters'] ?? p['diameter'],
+                              );
+                              final elong = p['elongation'] ?? '?';
+
+                              final lengthText =
+                                  lengthMeters != null ? lengthMeters.toStringAsFixed(2) : '?';
+                              final diameterMmText = diameterMeters != null
+                                  ? (diameterMeters * 1000).toStringAsFixed(1)
+                                  : '?';
+
+                              return Card(
+                                margin: const EdgeInsets.symmetric(vertical: 6),
+                                child: Padding(
+                                  padding: const EdgeInsets.all(12),
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        'Pipe ${i + 1}',
+                                        style: const TextStyle(
+                                          fontSize: 16,
+                                          fontWeight: FontWeight.bold,
+                                        ),
+                                      ),
+                                      const SizedBox(height: 6),
+                                      Text(
+                                        'Length: $lengthText m • Diameter: $diameterMmText mm • Elongation: $elong',
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                      ],
+
+                      Text('Status: $_statusText', style: const TextStyle(fontSize: 16)),
+                      const SizedBox(height: 6),
+                      const Divider(height: 2),
+
+                      SizedBox(
+                        height: max(200, available * 0.35),
+                        child: Container(
+                          margin: const EdgeInsets.only(top: 10),
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            border: Border.all(color: Colors.grey.shade400),
+                            borderRadius: BorderRadius.circular(8),
+                            color: Colors.grey.shade50,
+                          ),
+                          child: SingleChildScrollView(
+                            controller: _scrollController,
+                            child: Text(
+                              _outputJson.isEmpty ? 'No output yet.' : _outputJson,
+                              style: const TextStyle(fontFamily: 'Courier', fontSize: 14),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
