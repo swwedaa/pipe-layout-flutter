@@ -1,17 +1,18 @@
-# pipe_layout_flutter
+# Pipe Layout Backend (Windows + RTX 3090)
 
-A new Flutter project.
+FastAPI backend for pipe detection from 3D point clouds.
+Uses Open3D + PyTorch CUDA on Windows GPU.
 
-## Getting Started
+## Stack
+- Python 3.11
+- FastAPI + Uvicorn
+- Open3D
+- PyTorch (CUDA)
 
-This project is a starting point for a Flutter application.
+## Local setup (Windows PowerShell)
 
-A few resources to get you started if this is your first Flutter project:
-
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
-
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+```powershell
+cd C:\pipe-layout-backend
+py -3.11 -m venv .venv
+C:\pipe-layout-backend\.venv\Scripts\python.exe -m pip install --upgrade pip
+C:\pipe-layout-backend\.venv\Scripts\python.exe -m pip install -r requirements.txt
