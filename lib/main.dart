@@ -6,9 +6,9 @@ import 'dart:math';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
   runApp(const PipeLayoutApp());
@@ -40,10 +40,20 @@ class PipeLayoutHomePage extends StatefulWidget {
 class _PipeLayoutHomePageState extends State<PipeLayoutHomePage> {
   final TextEditingController _urlController =
       TextEditingController(text: 'http://192.168.4.70:8000');
-  final ScrollController _scrollController = ScrollController();
+
+  // Job metadata
+  final TextEditingController _jobController = TextEditingController();
+  final TextEditingController _operatorController = TextEditingController();
+  final TextEditingController _siteController = TextEditingController();
+
+  // Hanger rod length for each rod (ft)
+  final TextEditingController _rodLengthController =
+      TextEditingController(text: '1.0');
+
+  final ScrollController _outputScrollController = ScrollController();
 
   SharedPreferences? _prefs;
-  Timer? _saveUrlDebounce;
+  Timer? _saveDebounce;
 
   bool _busy = false;
   String _status = 'Ready';
@@ -52,7 +62,6 @@ class _PipeLayoutHomePageState extends State<PipeLayoutHomePage> {
   List<List<double>>? _loadedPoints;
   String? _loadedFileName;
 
-  // New: latest processed result summary
   int? _lastProcessingMs;
   String? _lastDevice;
   List<Map<String, dynamic>> _pipeCards = [];
@@ -60,28 +69,51 @@ class _PipeLayoutHomePageState extends State<PipeLayoutHomePage> {
   static const Duration shortTimeout = Duration(seconds: 15);
   static const Duration longTimeout = Duration(seconds: 60);
 
+  static const double _metersToFeet = 3.28084;
+  static const double _oneFootMeters = 0.3048;
+
   @override
   void initState() {
     super.initState();
     _initPrefs();
-    _urlController.addListener(_onUrlChanged);
+
+    _urlController.addListener(_onAnyInputChanged);
+    _jobController.addListener(_onAnyInputChanged);
+    _operatorController.addListener(_onAnyInputChanged);
+    _siteController.addListener(_onAnyInputChanged);
+    _rodLengthController.addListener(_onAnyInputChanged);
   }
 
   Future<void> _initPrefs() async {
     _prefs = await SharedPreferences.getInstance();
-    final saved = _prefs?.getString('backend_url');
-    if (saved != null && saved.trim().isNotEmpty && mounted) {
-      setState(() => _urlController.text = saved.trim());
-    }
+
+    final url = _prefs?.getString('backend_url');
+    final job = _prefs?.getString('job_name');
+    final operatorName = _prefs?.getString('operator_name');
+    final site = _prefs?.getString('site_address');
+    final rodLength = _prefs?.getString('rod_length_ft_each');
+
+    if (!mounted) return;
+
+    setState(() {
+      if (url != null && url.trim().isNotEmpty) _urlController.text = url.trim();
+      if (job != null) _jobController.text = job;
+      if (operatorName != null) _operatorController.text = operatorName;
+      if (site != null) _siteController.text = site;
+      if (rodLength != null && rodLength.trim().isNotEmpty) {
+        _rodLengthController.text = rodLength.trim();
+      }
+    });
   }
 
-  void _onUrlChanged() {
-    _saveUrlDebounce?.cancel();
-    _saveUrlDebounce = Timer(const Duration(milliseconds: 500), () async {
-      final url = _urlController.text.trim();
-      if (url.isNotEmpty) {
-        await _prefs?.setString('backend_url', url);
-      }
+  void _onAnyInputChanged() {
+    _saveDebounce?.cancel();
+    _saveDebounce = Timer(const Duration(milliseconds: 400), () async {
+      await _prefs?.setString('backend_url', _urlController.text.trim());
+      await _prefs?.setString('job_name', _jobController.text.trim());
+      await _prefs?.setString('operator_name', _operatorController.text.trim());
+      await _prefs?.setString('site_address', _siteController.text.trim());
+      await _prefs?.setString('rod_length_ft_each', _rodLengthController.text.trim());
     });
   }
 
@@ -90,43 +122,128 @@ class _PipeLayoutHomePageState extends State<PipeLayoutHomePage> {
     return Uri.parse('$base$path');
   }
 
-  double? _toDouble(dynamic v) {
-    if (v is num) return v.toDouble();
-    if (v is String) return double.tryParse(v);
+  double _currentRodLengthFt() {
+    final v = double.tryParse(_rodLengthController.text.trim());
+    if (v == null || v <= 0) return 1.0;
+    return v;
+  }
+
+  double? _toDouble(dynamic value) {
+    if (value is num) return value.toDouble();
+    if (value is String) return double.tryParse(value);
     return null;
   }
 
-  int? _toInt(dynamic v) {
-    if (v is int) return v;
-    if (v is num) return v.toInt();
-    if (v is String) return int.tryParse(v);
+  int? _toInt(dynamic value) {
+    if (value is int) return value;
+    if (value is num) return value.toInt();
+    if (value is String) return int.tryParse(value);
     return null;
   }
 
-  void _updatePipeCardsFromResponse(Map<String, dynamic> resp) {
-    final rawPipes = resp['pipes'];
-    final cards = <Map<String, dynamic>>[];
+  Map<String, dynamic> _metaPayload() {
+    final meta = <String, dynamic>{};
 
+    final job = _jobController.text.trim();
+    final op = _operatorController.text.trim();
+    final site = _siteController.text.trim();
+    final rodEachFt = _currentRodLengthFt();
+
+    if (job.isNotEmpty) meta['job_name'] = job;
+    if (op.isNotEmpty) meta['operator'] = op;
+    if (site.isNotEmpty) meta['site_address'] = site;
+
+    meta['rod_length_ft_each'] = rodEachFt;
+    meta['rod_rule'] = '2 rods per pipe; if pipe length < 1 ft then 1 rod';
+
+    return meta;
+  }
+
+  /// App-side enrichment:
+  /// - if pipe < 1ft => 1 rod
+  /// - else => 2 rods
+  Map<String, dynamic> _enrichWithRodMetadata(Map<String, dynamic> response) {
+    final out = Map<String, dynamic>.from(response);
+    final rodEachFt = _currentRodLengthFt();
+
+    final rawPipes = out['pipes'];
     if (rawPipes is List) {
-      for (final p in rawPipes) {
-        if (p is! Map<String, dynamic>) continue;
+      final enriched = <Map<String, dynamic>>[];
+
+      for (final item in rawPipes) {
+        if (item is! Map) continue;
+        final p = Map<String, dynamic>.from(item as Map);
+
+        final lengthM = _toDouble(
+          p['length_meters'] ?? p['length_m'] ?? p['length'],
+        );
+        final lengthFt = lengthM != null ? lengthM * _metersToFeet : null;
+
+        int rodCount = 2;
+        if (lengthM != null && lengthM < _oneFootMeters) rodCount = 1;
+
+        final rodLengthsFt = List<double>.filled(rodCount, rodEachFt);
+        final rodTotalFt = rodCount * rodEachFt;
+
+        p['pipe_length_ft'] = lengthFt;
+        p['recommended_hanger_rod_count'] = rodCount;
+        p['recommended_hanger_rod_lengths_ft'] = rodLengthsFt;
+        p['recommended_hanger_rod_total_ft'] = rodTotalFt;
+        p['rod_rule_applied'] = 'if length < 1ft => 1 rod else 2 rods';
+
+        enriched.add(p);
+      }
+
+      out['pipes'] = enriched;
+    }
+
+    final mergedMeta = <String, dynamic>{};
+    if (out['meta'] is Map) {
+      mergedMeta.addAll(Map<String, dynamic>.from(out['meta'] as Map));
+    }
+    mergedMeta.addAll(_metaPayload());
+    out['meta'] = mergedMeta;
+    out['job_metadata'] = mergedMeta;
+
+    return out;
+  }
+
+  void _updatePipeCardsFromResponse(Map<String, dynamic> response) {
+    final raw = response['pipes'];
+    final cards = <Map<String, dynamic>>[];
+    final rodEachFt = _currentRodLengthFt();
+
+    if (raw is List) {
+      for (final item in raw) {
+        if (item is! Map) continue;
+        final p = Map<String, dynamic>.from(item as Map);
 
         final lengthM = _toDouble(p['length_meters'] ?? p['length']);
         final diameterM = _toDouble(p['diameter_meters'] ?? p['diameter']);
         final elong = _toDouble(p['elongation']);
+        final confidence = _toDouble(p['confidence']);
+
+        int rodCount = _toInt(p['recommended_hanger_rod_count']) ??
+            ((lengthM != null && lengthM < _oneFootMeters) ? 1 : 2);
+
+        final rodTotalFt = _toDouble(p['recommended_hanger_rod_total_ft']) ??
+            (rodCount * rodEachFt);
 
         cards.add({
           'length_m': lengthM,
           'diameter_mm': diameterM != null ? diameterM * 1000.0 : null,
           'elongation': elong,
+          'confidence': confidence,
+          'rod_count': rodCount,
+          'rod_total_ft': rodTotalFt,
         });
       }
     }
 
     if (!mounted) return;
     setState(() {
-      _lastProcessingMs = _toInt(resp['processing_ms']);
-      _lastDevice = resp['device']?.toString();
+      _lastProcessingMs = _toInt(response['processing_ms']);
+      _lastDevice = response['device']?.toString();
       _pipeCards = cards;
     });
   }
@@ -139,18 +256,22 @@ class _PipeLayoutHomePageState extends State<PipeLayoutHomePage> {
   Future<void> _setOutput(dynamic obj) async {
     if (!mounted) return;
     setState(() => _output = const JsonEncoder.withIndent('  ').convert(obj));
+
     await Future.delayed(const Duration(milliseconds: 10));
-    if (_scrollController.hasClients) {
-      _scrollController.animateTo(
-        _scrollController.position.maxScrollExtent,
-        duration: const Duration(milliseconds: 200),
+    if (_outputScrollController.hasClients) {
+      _outputScrollController.animateTo(
+        _outputScrollController.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 220),
         curve: Curves.easeOut,
       );
     }
   }
 
-  Future<Map<String, dynamic>> _request(Future<http.Response> req, Duration timeout) async {
-    final resp = await req.timeout(timeout);
+  Future<Map<String, dynamic>> _request(
+    Future<http.Response> request,
+    Duration timeout,
+  ) async {
+    final resp = await request.timeout(timeout);
     final body = resp.body.isEmpty ? '{}' : resp.body;
 
     if (resp.statusCode < 200 || resp.statusCode >= 300) {
@@ -162,15 +283,16 @@ class _PipeLayoutHomePageState extends State<PipeLayoutHomePage> {
     return {'data': decoded};
   }
 
-  Future<void> _run(String label, Future<void> Function() fn) async {
+  Future<void> _run(String label, Future<void> Function() action) async {
     if (_busy) return;
+
     setState(() {
       _busy = true;
       _status = '$label...';
     });
 
     try {
-      await fn();
+      await action();
       await _setStatus('$label OK');
     } on TimeoutException {
       await _setStatus('$label timeout');
@@ -183,16 +305,19 @@ class _PipeLayoutHomePageState extends State<PipeLayoutHomePage> {
     }
   }
 
-  List<List<double>> _syntheticPoints({int pipePoints = 8000, int noisePoints = 500}) {
+  List<List<double>> _syntheticPoints({
+    int pipePoints = 8000,
+    int noisePoints = 500,
+  }) {
     final rnd = Random();
     final points = <List<double>>[];
 
     for (int i = 0; i < pipePoints; i++) {
       final x = -2.0 + rnd.nextDouble() * 4.0;
-      final t = rnd.nextDouble() * 2 * pi;
+      final theta = rnd.nextDouble() * 2 * pi;
       final r = 0.02 + (rnd.nextDouble() * 0.004 - 0.002);
-      final y = r * cos(t) + (rnd.nextDouble() * 0.004 - 0.002);
-      final z = r * sin(t) + (rnd.nextDouble() * 0.004 - 0.002);
+      final y = r * cos(theta) + (rnd.nextDouble() * 0.004 - 0.002);
+      final z = r * sin(theta) + (rnd.nextDouble() * 0.004 - 0.002);
       points.add([x, y, z]);
     }
 
@@ -207,76 +332,103 @@ class _PipeLayoutHomePageState extends State<PipeLayoutHomePage> {
     return points;
   }
 
-  List<List<double>> _extractPoints(dynamic data) {
-    final dynamic raw = (data is Map<String, dynamic>) ? data['points'] : data;
+  List<List<double>> _extractPoints(dynamic decoded) {
+    final dynamic raw = (decoded is Map<String, dynamic>) ? decoded['points'] : decoded;
+
     if (raw is! List) {
       throw Exception('JSON must be a list or {"points":[...]}');
     }
 
-    final out = <List<double>>[];
+    final result = <List<double>>[];
     for (final p in raw) {
       if (p is List && p.length == 3) {
         final x = (p[0] as num?)?.toDouble();
         final y = (p[1] as num?)?.toDouble();
         final z = (p[2] as num?)?.toDouble();
-        if (x != null && y != null && z != null) out.add([x, y, z]);
+        if (x != null && y != null && z != null) result.add([x, y, z]);
       }
     }
 
-    if (out.length < 200) {
-      throw Exception('Need at least 200 valid points, found ${out.length}');
+    if (result.length < 200) {
+      throw Exception('Need at least 200 valid points, found ${result.length}');
     }
 
-    return out;
+    return result;
   }
 
-  Future<void> _health() async {
-    await _run('Health', () async {
+  Future<void> _healthCheck() async {
+    await _run('Health check', () async {
       final result = await _request(http.get(_uri('/health')), shortTimeout);
       await _setOutput({'endpoint': '/health', 'response': result});
     });
   }
 
-  Future<void> _sendSynthetic() async {
-    await _run('Synthetic scan', () async {
+  Future<void> _sendSyntheticScan() async {
+    await _run('Process synthetic scan', () async {
       final points = _syntheticPoints();
       final result = await _request(
         http.post(
           _uri('/process_scan'),
           headers: {'Content-Type': 'application/json'},
-          body: json.encode({'points': points}),
+          body: json.encode({
+            'points': points,
+            'meta': _metaPayload(),
+          }),
         ),
         longTimeout,
       );
-      _updatePipeCardsFromResponse(result);
-      await _setOutput({'endpoint': '/process_scan', 'points_sent': points.length, 'response': result});
+
+      final enriched = _enrichWithRodMetadata(result);
+      _updatePipeCardsFromResponse(enriched);
+
+      await _setOutput({
+        'endpoint': '/process_scan',
+        'points_sent': points.length,
+        'meta': _metaPayload(),
+        'response': enriched,
+      });
     });
   }
 
-  Future<void> _saveSynthetic() async {
-    await _run('Save synthetic', () async {
+  Future<void> _saveSyntheticScan() async {
+    await _run('Save synthetic scan', () async {
       final points = _syntheticPoints();
       final result = await _request(
         http.post(
           _uri('/save_scan'),
           headers: {'Content-Type': 'application/json'},
-          body: json.encode({'points': points, 'tag': 'flutter'}),
+          body: json.encode({
+            'points': points,
+            'tag': 'flutter',
+            'meta': _metaPayload(),
+          }),
         ),
         longTimeout,
       );
-      await _setOutput({'endpoint': '/save_scan', 'response': result});
+
+      await _setOutput({
+        'endpoint': '/save_scan',
+        'meta': _metaPayload(),
+        'response': result,
+      });
     });
   }
 
-  Future<void> _replayLatest() async {
-    await _run('Replay latest', () async {
-      final list = await _request(http.get(_uri('/list_scans')), shortTimeout);
-      final scans = list['scans'];
-      if (scans is! List || scans.isEmpty) throw Exception('No scans from /list_scans');
+  Future<void> _replayLatestScan() async {
+    await _run('Replay latest scan', () async {
+      final listResult = await _request(http.get(_uri('/list_scans')), shortTimeout);
+      final scans = listResult['scans'];
+
+      if (scans is! List || scans.isEmpty) {
+        throw Exception('No scans available from /list_scans');
+      }
 
       final latest = scans.first;
-      final filePath = (latest is Map<String, dynamic>) ? latest['file_path'] : null;
-      if (filePath == null) throw Exception('Latest scan missing file_path');
+      if (latest is! Map || latest['file_path'] == null) {
+        throw Exception('Latest scan missing file_path');
+      }
+
+      final filePath = latest['file_path'].toString();
 
       final result = await _request(
         http.post(
@@ -286,13 +438,20 @@ class _PipeLayoutHomePageState extends State<PipeLayoutHomePage> {
         ),
         longTimeout,
       );
-      _updatePipeCardsFromResponse(result);
-      await _setOutput({'endpoint': '/process_scan_file', 'file_path': filePath, 'response': result});
+
+      final enriched = _enrichWithRodMetadata(result);
+      _updatePipeCardsFromResponse(enriched);
+
+      await _setOutput({
+        'endpoint': '/process_scan_file',
+        'file_path': filePath,
+        'response': enriched,
+      });
     });
   }
 
   Future<void> _loadScanJson() async {
-    await _run('Load JSON file', () async {
+    await _run('Load JSON scan', () async {
       final picked = await FilePicker.platform.pickFiles(
         type: FileType.custom,
         allowedExtensions: ['json'],
@@ -304,66 +463,81 @@ class _PipeLayoutHomePageState extends State<PipeLayoutHomePage> {
       }
 
       final file = picked.files.first;
-      final name = file.name;
-      String content;
+      final fileName = file.name;
 
+      String content;
       if (file.bytes != null) {
         content = utf8.decode(file.bytes!);
       } else if (file.path != null) {
         content = await File(file.path!).readAsString();
       } else {
-        throw Exception('Cannot read selected file');
+        throw Exception('Unable to read selected file');
       }
 
       final decoded = json.decode(content);
-      final pts = _extractPoints(decoded);
+      final points = _extractPoints(decoded);
 
       if (!mounted) return;
       setState(() {
-        _loadedPoints = pts;
-        _loadedFileName = name;
+        _loadedPoints = points;
+        _loadedFileName = fileName;
       });
 
-      await _setOutput({'action': 'load_scan_json', 'file': name, 'valid_points': pts.length});
+      await _setOutput({
+        'action': 'load_scan_json',
+        'file': fileName,
+        'valid_points': points.length,
+      });
     });
   }
 
   Future<void> _processLoadedScan() async {
     await _run('Process loaded scan', () async {
-      final pts = _loadedPoints;
-      if (pts == null || pts.isEmpty) {
-        throw Exception('No loaded scan. Tap "Load Scan JSON" first.');
+      final points = _loadedPoints;
+      if (points == null || points.isEmpty) {
+        throw Exception('No loaded file. Tap "Load Scan JSON" first.');
       }
 
       final result = await _request(
         http.post(
           _uri('/process_scan'),
           headers: {'Content-Type': 'application/json'},
-          body: json.encode({'points': pts}),
+          body: json.encode({
+            'points': points,
+            'meta': _metaPayload(),
+          }),
         ),
         longTimeout,
       );
-      _updatePipeCardsFromResponse(result);
+
+      final enriched = _enrichWithRodMetadata(result);
+      _updatePipeCardsFromResponse(enriched);
+
       await _setOutput({
         'endpoint': '/process_scan',
-        'source': _loadedFileName ?? 'loaded_json',
-        'points_sent': pts.length,
-        'response': result,
+        'source_file': _loadedFileName ?? 'loaded.json',
+        'points_sent': points.length,
+        'meta': _metaPayload(),
+        'response': enriched,
       });
     });
   }
 
-  Future<void> _smokeTest() async {
+  Future<void> _runSmokeTest() async {
     await _run('Smoke test', () async {
       final health = await _request(http.get(_uri('/health')), shortTimeout);
-      if (health['ok'] != true) throw Exception('Health check did not return ok=true');
+      if (health['ok'] != true) throw Exception('Health check failed');
 
       final points = _syntheticPoints(pipePoints: 5000, noisePoints: 300);
       final save = await _request(
         http.post(
           _uri('/save_scan'),
           headers: {'Content-Type': 'application/json'},
-          body: json.encode({'points': points, 'tag': 'smoke_flutter'}),
+          body: json.encode({
+            'points': points,
+            'tag': 'smoke_flutter',
+            'meta': _metaPayload(),
+          }),
         ),
         longTimeout,
       );
@@ -385,25 +559,32 @@ class _PipeLayoutHomePageState extends State<PipeLayoutHomePage> {
       final pipeCount = (replay['pipe_count'] as num?)?.toInt() ?? 0;
       if (pipeCount < 1) throw Exception('Smoke test failed: pipe_count=$pipeCount');
 
-      _updatePipeCardsFromResponse(replay);
-      await _setOutput({'smoke_test': 'PASS', 'health': health, 'save_scan': save, 'replay': replay});
+      final enriched = _enrichWithRodMetadata(replay);
+      _updatePipeCardsFromResponse(enriched);
+
+      await _setOutput({
+        'smoke_test': 'PASS',
+        'meta': _metaPayload(),
+        'health': health,
+        'save_scan': save,
+        'replay': enriched,
+      });
     });
   }
 
-
   Future<void> _exportLatestReport() async {
     await _run('Export report', () async {
-      final report = _output.trim();
-      if (report.isEmpty || report == 'No output yet.') {
+      final reportText = _output.trim();
+      if (reportText.isEmpty || reportText == 'No output yet.') {
         throw Exception('No report available. Run a scan first.');
       }
 
       final now = DateTime.now().toIso8601String().replaceAll(':', '-');
       final fileName = 'pipe_report_$now.json';
-
       final tempDir = await getTemporaryDirectory();
+
       final file = File('${tempDir.path}/$fileName');
-      await file.writeAsString(report);
+      await file.writeAsString(reportText);
 
       await SharePlus.instance.share(
         ShareParams(
@@ -414,14 +595,80 @@ class _PipeLayoutHomePageState extends State<PipeLayoutHomePage> {
     });
   }
 
-  Widget _button(String title, VoidCallback onPressed, {Color? color}) {
+  String _csvEscape(dynamic value) {
+    if (value == null) return '';
+    final raw = value.toString().replaceAll('"', '""');
+    final needsQuotes = raw.contains(',') || raw.contains('\n') || raw.contains('"');
+    return needsQuotes ? '"$raw"' : raw;
+  }
+
+  Future<void> _exportCsvReport() async {
+    await _run('Export CSV report', () async {
+      if (_pipeCards.isEmpty) {
+        throw Exception('No pipe data to export. Run a scan first.');
+      }
+
+      final meta = _metaPayload();
+      final timestamp = DateTime.now().toIso8601String();
+
+      final sb = StringBuffer();
+      sb.writeln(
+        'timestamp,job_name,operator,site_address,pipe_index,length_m,length_ft,diameter_mm,elongation,confidence,rod_count,rod_total_ft,processing_ms,device',
+      );
+
+      for (var i = 0; i < _pipeCards.length; i++) {
+        final p = _pipeCards[i];
+        final lengthM = _toDouble(p['length_m']);
+        final lengthFt = lengthM != null ? lengthM * _metersToFeet : null;
+        final diameterMm = _toDouble(p['diameter_mm']);
+        final elong = _toDouble(p['elongation']);
+        final conf = _toDouble(p['confidence']);
+        final rodCount = _toInt(p['rod_count']);
+        final rodTotalFt = _toDouble(p['rod_total_ft']);
+
+        final row = [
+          timestamp,
+          meta['job_name'] ?? '',
+          meta['operator'] ?? '',
+          meta['site_address'] ?? '',
+          i + 1,
+          lengthM?.toStringAsFixed(4) ?? '',
+          lengthFt?.toStringAsFixed(3) ?? '',
+          diameterMm?.toStringAsFixed(2) ?? '',
+          elong?.toStringAsFixed(3) ?? '',
+          conf?.toStringAsFixed(3) ?? '',
+          rodCount ?? '',
+          rodTotalFt?.toStringAsFixed(3) ?? '',
+          _lastProcessingMs ?? '',
+          _lastDevice ?? '',
+        ];
+
+        sb.writeln(row.map(_csvEscape).join(','));
+      }
+
+      final fileName =
+          'pipe_report_${DateTime.now().toIso8601String().replaceAll(':', '-')}.csv';
+      final dir = await getTemporaryDirectory();
+      final file = File('${dir.path}/$fileName');
+      await file.writeAsString(sb.toString());
+
+      await SharePlus.instance.share(
+        ShareParams(
+          text: 'Pipe Layout CSV report',
+          files: [XFile(file.path)],
+        ),
+      );
+    });
+  }
+
+  Widget _actionButton(String title, VoidCallback onTap, {Color? color}) {
     return SizedBox(
       width: double.infinity,
       height: 54,
       child: Padding(
         padding: const EdgeInsets.symmetric(vertical: 4),
         child: ElevatedButton(
-          onPressed: _busy ? null : onPressed,
+          onPressed: _busy ? null : onTap,
           style: ElevatedButton.styleFrom(
             backgroundColor: color,
             textStyle: const TextStyle(fontSize: 17, fontWeight: FontWeight.w600),
@@ -434,110 +681,185 @@ class _PipeLayoutHomePageState extends State<PipeLayoutHomePage> {
 
   @override
   void dispose() {
-    _saveUrlDebounce?.cancel();
-    _urlController.removeListener(_onUrlChanged);
+    _saveDebounce?.cancel();
+
+    _urlController.removeListener(_onAnyInputChanged);
+    _jobController.removeListener(_onAnyInputChanged);
+    _operatorController.removeListener(_onAnyInputChanged);
+    _siteController.removeListener(_onAnyInputChanged);
+    _rodLengthController.removeListener(_onAnyInputChanged);
+
     _urlController.dispose();
-    _scrollController.dispose();
+    _jobController.dispose();
+    _operatorController.dispose();
+    _siteController.dispose();
+    _rodLengthController.dispose();
+    _outputScrollController.dispose();
+
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    final processingLine = (_lastProcessingMs != null || _lastDevice != null)
+        ? 'Latest processing: ${_lastProcessingMs ?? '?'} ms on ${_lastDevice ?? '?'}'
+        : null;
+
     return Scaffold(
       appBar: AppBar(title: const Text('Pipe Layout Scanner')),
       body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.all(12),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text('Backend URL', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-              const SizedBox(height: 6),
-              TextField(
-                controller: _urlController,
-                decoration: const InputDecoration(
-                  border: OutlineInputBorder(),
-                  hintText: 'http://192.168.4.70:8000',
-                ),
-              ),
-              const SizedBox(height: 8),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            return SingleChildScrollView(
+              padding: const EdgeInsets.all(12),
+              child: ConstrainedBox(
+                constraints: BoxConstraints(minHeight: constraints.maxHeight - 24),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'Backend URL',
+                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 6),
+                    TextField(
+                      controller: _urlController,
+                      decoration: const InputDecoration(
+                        border: OutlineInputBorder(),
+                        hintText: 'http://192.168.4.70:8000',
+                      ),
+                    ),
 
-              _button('Health Check', _health, color: Colors.blue),
-              _button('Send Synthetic Scan', _sendSynthetic, color: Colors.green),
-              _button('Save Synthetic Scan', _saveSynthetic, color: Colors.orange),
-              _button('Replay Latest Scan', _replayLatest, color: Colors.purple),
-              _button('Load Scan JSON', _loadScanJson, color: Colors.teal),
-              _button('Process Loaded Scan', _processLoadedScan, color: Colors.indigo),
-              _button('Run Smoke Test', _smokeTest, color: Colors.redAccent),
-              _button('Export Latest Report', _exportLatestReport, color: Colors.brown),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: _jobController,
+                      decoration: const InputDecoration(
+                        border: OutlineInputBorder(),
+                        labelText: 'Job Name',
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    TextField(
+                      controller: _operatorController,
+                      decoration: const InputDecoration(
+                        border: OutlineInputBorder(),
+                        labelText: 'Operator',
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    TextField(
+                      controller: _siteController,
+                      decoration: const InputDecoration(
+                        border: OutlineInputBorder(),
+                        labelText: 'Site Address',
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    TextField(
+                      controller: _rodLengthController,
+                      keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                      decoration: const InputDecoration(
+                        border: OutlineInputBorder(),
+                        labelText: 'Rod Length Each (ft)',
+                        hintText: '1.0',
+                      ),
+                    ),
 
-              const SizedBox(height: 6),
-              Text('Status: $_status', style: const TextStyle(fontWeight: FontWeight.w600)),
-              if (_loadedPoints != null) ...[
-                const SizedBox(height: 4),
-                Text('Loaded file: ${_loadedFileName ?? '-'} | points: ${_loadedPoints!.length}'),
-              ],
+                    const SizedBox(height: 8),
+                    _actionButton('Health Check', _healthCheck, color: Colors.blue),
+                    _actionButton('Send Synthetic Scan', _sendSyntheticScan, color: Colors.green),
+                    _actionButton('Save Synthetic Scan', _saveSyntheticScan, color: Colors.orange),
+                    _actionButton('Replay Latest Scan', _replayLatestScan, color: Colors.purple),
+                    _actionButton('Load Scan JSON', _loadScanJson, color: Colors.teal),
+                    _actionButton('Process Loaded Scan', _processLoadedScan, color: Colors.indigo),
+                    _actionButton('Run Smoke Test', _runSmokeTest, color: Colors.redAccent),
+                    _actionButton('Export Latest Report', _exportLatestReport, color: Colors.brown),
+                    _actionButton('Export CSV Report', _exportCsvReport, color: Colors.deepOrange),
 
-              if (_lastProcessingMs != null || _pipeCards.isNotEmpty) ...[
-                const SizedBox(height: 8),
-                Text(
-                  'Latest Processing: ${_lastProcessingMs ?? '?'} ms on ${_lastDevice ?? '?'}',
-                  style: const TextStyle(fontWeight: FontWeight.w700),
-                ),
-                const SizedBox(height: 6),
-                SizedBox(
-                  height: 140,
-                  child: _pipeCards.isEmpty
-                      ? const Center(child: Text('No pipes detected in latest run.'))
-                      : ListView.builder(
+                    const SizedBox(height: 8),
+                    Text('Status: $_status', style: const TextStyle(fontWeight: FontWeight.w600)),
+                    if (_loadedPoints != null)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4),
+                        child: Text(
+                          'Loaded file: ${_loadedFileName ?? '-'} | points: ${_loadedPoints!.length}',
+                        ),
+                      ),
+
+                    if (processingLine != null) ...[
+                      const SizedBox(height: 8),
+                      Text(processingLine, style: const TextStyle(fontWeight: FontWeight.w700)),
+                    ],
+
+                    if (_pipeCards.isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      const Text(
+                        'Detected Pipes',
+                        style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                      ),
+                      const SizedBox(height: 4),
+                      SizedBox(
+                        height: 180,
+                        child: ListView.builder(
                           itemCount: _pipeCards.length,
-                          itemBuilder: (context, i) {
-                            final p = _pipeCards[i];
-                            final l = p['length_m'] as double?;
-                            final d = p['diameter_mm'] as double?;
-                            final e = p['elongation'] as double?;
+                          itemBuilder: (context, index) {
+                            final p = _pipeCards[index];
+                            final length = p['length_m'] as double?;
+                            final diameter = p['diameter_mm'] as double?;
+                            final elong = p['elongation'] as double?;
+                            final conf = p['confidence'] as double?;
+                            final rodCount = p['rod_count'] as int?;
+                            final rodTotal = p['rod_total_ft'] as double?;
 
                             return Card(
                               margin: const EdgeInsets.symmetric(vertical: 4),
                               child: Padding(
                                 padding: const EdgeInsets.all(10),
                                 child: Text(
-                                  'Pipe ${i + 1}  •  Length: ${l?.toStringAsFixed(2) ?? '?'} m  •  '
-                                  'Diameter: ${d?.toStringAsFixed(1) ?? '?'} mm  •  '
-                                  'Elongation: ${e?.toStringAsFixed(2) ?? '?'}',
+                                  'Pipe ${index + 1}  •  '
+                                  'Length: ${length?.toStringAsFixed(2) ?? '?'} m  •  '
+                                  'Diameter: ${diameter?.toStringAsFixed(1) ?? '?'} mm  •  '
+                                  'Elong: ${elong?.toStringAsFixed(2) ?? '?'}  •  '
+                                  'Conf: ${conf?.toStringAsFixed(2) ?? '?'}  •  '
+                                  'Rods: ${rodCount ?? '?'}  •  '
+                                  'Rod Total: ${rodTotal?.toStringAsFixed(2) ?? '?'} ft',
                                   style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
                                 ),
                               ),
                             );
                           },
                         ),
-                ),
-              ],
+                      ),
+                    ],
 
-              const SizedBox(height: 6),
-              const Divider(height: 1),
-              const SizedBox(height: 6),
+                    const SizedBox(height: 10),
+                    const Divider(height: 1),
+                    const SizedBox(height: 8),
 
-              Expanded(
-                child: Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.all(10),
-                  decoration: BoxDecoration(
-                    border: Border.all(color: Colors.grey.shade400),
-                    borderRadius: BorderRadius.circular(8),
-                    color: Colors.grey.shade50,
-                  ),
-                  child: SingleChildScrollView(
-                    controller: _scrollController,
-                    child: Text(
-                      _output.isEmpty ? 'No output yet.' : _output,
-                      style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+                    SizedBox(
+                      height: 260,
+                      child: Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(
+                          border: Border.all(color: Colors.grey.shade400),
+                          borderRadius: BorderRadius.circular(8),
+                          color: Colors.grey.shade50,
+                        ),
+                        child: SingleChildScrollView(
+                          controller: _outputScrollController,
+                          child: Text(
+                            _output.isEmpty ? 'No output yet.' : _output,
+                            style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+                          ),
+                        ),
+                      ),
                     ),
-                  ),
+                  ],
                 ),
               ),
-            ],
-          ),
+            );
+          },
         ),
       ),
     );
