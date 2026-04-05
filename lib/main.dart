@@ -5,6 +5,7 @@ import 'dart:math';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
+import 'package:model_viewer_plus/model_viewer_plus.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
@@ -349,10 +350,6 @@ class _PipeLayoutHomePageState extends State<PipeLayoutHomePage> {
       }
     }
 
-    if (result.length < 200) {
-      throw Exception('Need at least 200 valid points, found ${result.length}');
-    }
-
     return result;
   }
 
@@ -450,6 +447,56 @@ class _PipeLayoutHomePageState extends State<PipeLayoutHomePage> {
     });
   }
 
+  Future<void> _previewGlbMetaroom() async {
+    if (_busy) return;
+
+    final picked = await FilePicker.platform.pickFiles(
+      type: FileType.any,
+      allowMultiple: false,
+      withData: false,
+    );
+
+    if (!mounted) return;
+    if (picked == null || picked.files.isEmpty) return;
+
+    final file = picked.files.first;
+    final nameOk = file.name.toLowerCase().endsWith('.glb');
+    final pathStr = file.path;
+    final pathOk =
+        pathStr != null && pathStr.isNotEmpty && pathStr.toLowerCase().endsWith('.glb');
+    if (!nameOk && !pathOk) {
+      if (mounted) setState(() => _status = 'Please choose a .glb file');
+      return;
+    }
+
+    String? path = file.path;
+
+    if (path == null || path.isEmpty) {
+      if (file.bytes != null && file.bytes!.isNotEmpty) {
+        final dir = await getTemporaryDirectory();
+        path = '${dir.path}/metaroom_preview_${DateTime.now().millisecondsSinceEpoch}.glb';
+        await File(path).writeAsBytes(file.bytes!);
+      }
+    }
+
+    if (path == null || !File(path).existsSync()) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Could not open GLB file.')),
+        );
+      }
+      return;
+    }
+
+    if (!mounted) return;
+    await Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        fullscreenDialog: true,
+        builder: (context) => GlbViewerPage(filePath: path!),
+      ),
+    );
+  }
+
   Future<void> _loadScanJson() async {
     await _run('Load JSON scan', () async {
       final picked = await FilePicker.platform.pickFiles(
@@ -491,24 +538,50 @@ class _PipeLayoutHomePageState extends State<PipeLayoutHomePage> {
     });
   }
 
-  Future<void> _processLoadedScan() async {
+    List<List<double>> _preparePointsForUpload(
+    List<List<double>> points, {
+    int maxPoints = 25000,
+  }) {
+    if (points.length <= maxPoints) return points;
+
+    final step = (points.length / maxPoints).ceil();
+    final reduced = <List<double>>[];
+    for (int i = 0; i < points.length; i += step) {
+      reduced.add(points[i]);
+    }
+    return reduced;
+  }
+
+Future<void> _processLoadedScan() async {
     await _run('Process loaded scan', () async {
       final points = _loadedPoints;
       if (points == null || points.isEmpty) {
         throw Exception('No loaded file. Tap "Load Scan JSON" first.');
       }
 
-      final result = await _request(
-        http.post(
-          _uri('/process_scan'),
-          headers: {'Content-Type': 'application/json'},
-          body: json.encode({
-            'points': points,
-            'meta': _metaPayload(),
-          }),
-        ),
-        longTimeout,
-      );
+      if (points.length < 200) {
+        throw Exception('Loaded file has too few points (${points.length}). Need at least 200.');
+      }
+
+      // Reduce huge files to keep payload reliable on mobile network paths
+      final prepared = _preparePointsForUpload(points, maxPoints: 25000);
+
+      final response = await http.post(
+        _uri('/process_scan'),
+        headers: {'Content-Type': 'application/json'},
+        body: json.encode({
+          'points': prepared,
+          'meta': _metaPayload(),
+        }),
+      ).timeout(const Duration(seconds: 120));
+
+      final body = response.body.isEmpty ? '{}' : response.body;
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw Exception('process_scan failed (HTTP ${response.statusCode}): $body');
+      }
+
+      final decoded = json.decode(body);
+      final result = decoded is Map<String, dynamic> ? decoded : {'data': decoded};
 
       final enriched = _enrichWithRodMetadata(result);
       _updatePipeCardsFromResponse(enriched);
@@ -516,7 +589,8 @@ class _PipeLayoutHomePageState extends State<PipeLayoutHomePage> {
       await _setOutput({
         'endpoint': '/process_scan',
         'source_file': _loadedFileName ?? 'loaded.json',
-        'points_sent': points.length,
+        'original_points': points.length,
+        'sent_points': prepared.length,
         'meta': _metaPayload(),
         'response': enriched,
       });
@@ -661,42 +735,25 @@ class _PipeLayoutHomePageState extends State<PipeLayoutHomePage> {
     });
   }
 
-  Widget _actionButton(String title, VoidCallback onTap, {Color? color}) {
+  Widget _actionButton(String title, VoidCallback onTap, {Color? color, bool enabled = true}) {
     return SizedBox(
       width: double.infinity,
       height: 54,
       child: Padding(
         padding: const EdgeInsets.symmetric(vertical: 4),
         child: ElevatedButton(
-          onPressed: _busy ? null : onTap,
+          onPressed: (_busy || !enabled) ? null : onTap,
           style: ElevatedButton.styleFrom(
-            backgroundColor: color,
-            textStyle: const TextStyle(fontSize: 17, fontWeight: FontWeight.w600),
+            backgroundColor: const Color(0xFFFF69B4),
+            foregroundColor: Colors.black,
+            disabledBackgroundColor: const Color(0xFFFFC0DB),
+            disabledForegroundColor: Colors.black54,
+            textStyle: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700),
           ),
           child: Text(title),
         ),
       ),
     );
-  }
-
-  @override
-  void dispose() {
-    _saveDebounce?.cancel();
-
-    _urlController.removeListener(_onAnyInputChanged);
-    _jobController.removeListener(_onAnyInputChanged);
-    _operatorController.removeListener(_onAnyInputChanged);
-    _siteController.removeListener(_onAnyInputChanged);
-    _rodLengthController.removeListener(_onAnyInputChanged);
-
-    _urlController.dispose();
-    _jobController.dispose();
-    _operatorController.dispose();
-    _siteController.dispose();
-    _rodLengthController.dispose();
-    _outputScrollController.dispose();
-
-    super.dispose();
   }
 
   @override
@@ -728,6 +785,13 @@ class _PipeLayoutHomePageState extends State<PipeLayoutHomePage> {
                         border: OutlineInputBorder(),
                         hintText: 'http://192.168.4.70:8000',
                       ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      "On iPhone, use your Windows PC's LAN IP (e.g. http://192.168.x.x:8000), not 127.0.0.1.",
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                            color: Colors.grey.shade700,
+                          ),
                     ),
 
                     const SizedBox(height: 8),
@@ -771,20 +835,39 @@ class _PipeLayoutHomePageState extends State<PipeLayoutHomePage> {
                     _actionButton('Save Synthetic Scan', _saveSyntheticScan, color: Colors.orange),
                     _actionButton('Replay Latest Scan', _replayLatestScan, color: Colors.purple),
                     _actionButton('Load Scan JSON', _loadScanJson, color: Colors.teal),
-                    _actionButton('Process Loaded Scan', _processLoadedScan, color: Colors.indigo),
+                    _actionButton(
+                      'Process Loaded Scan',
+                      _processLoadedScan,
+                      color: Colors.indigo,
+                      enabled: _loadedPoints != null && _loadedPoints!.isNotEmpty,
+                    ),
                     _actionButton('Run Smoke Test', _runSmokeTest, color: Colors.redAccent),
                     _actionButton('Export Latest Report', _exportLatestReport, color: Colors.brown),
                     _actionButton('Export CSV Report', _exportCsvReport, color: Colors.deepOrange),
+                    _actionButton('Preview GLB (Metaroom)', _previewGlbMetaroom, color: Colors.blueGrey),
 
                     const SizedBox(height: 8),
                     Text('Status: $_status', style: const TextStyle(fontWeight: FontWeight.w600)),
-                    if (_loadedPoints != null)
+                    if (_loadedPoints != null) ...[
                       Padding(
                         padding: const EdgeInsets.only(top: 4),
                         child: Text(
                           'Loaded file: ${_loadedFileName ?? '-'} | points: ${_loadedPoints!.length}',
                         ),
                       ),
+                      if (_loadedPoints!.length < 200)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 4),
+                          child: Text(
+                            'Warning: backend needs at least 200 points (you have ${_loadedPoints!.length}).',
+                            style: TextStyle(
+                              color: Colors.orange.shade800,
+                              fontWeight: FontWeight.w600,
+                              fontSize: 13,
+                            ),
+                          ),
+                        ),
+                    ],
 
                     if (processingLine != null) ...[
                       const SizedBox(height: 8),
@@ -860,6 +943,34 @@ class _PipeLayoutHomePageState extends State<PipeLayoutHomePage> {
               ),
             );
           },
+        ),
+      ),
+    );
+  }
+}
+
+class GlbViewerPage extends StatelessWidget {
+  const GlbViewerPage({super.key, required this.filePath});
+
+  final String filePath;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF121212),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF121212),
+        foregroundColor: Colors.white,
+        title: const Text('GLB preview'),
+      ),
+      body: SafeArea(
+        child: ModelViewer(
+          src: Uri.file(filePath).toString(),
+          cameraControls: true,
+          autoRotate: true,
+          backgroundColor: const Color(0xFF121212),
+          alt: '3D model preview',
+          debugLogging: false,
         ),
       ),
     );
